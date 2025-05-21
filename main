@@ -1,0 +1,644 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <TinyGPSPlus.h>
+#include <DHT.h>
+#include "esp_camera.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "driver/rtc_io.h"
+#include <Adafruit_CCS811.h> // Add CCS811 library
+
+// Pin Definitions
+// Camera pins are predefined for ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     21
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       19
+#define Y4_GPIO_NUM       18
+#define Y3_GPIO_NUM        5
+#define Y2_GPIO_NUM        4
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// Sensor pins - updated to avoid conflicts with camera
+#define DHTPIN            15     // DHT11 data pin
+#define DHTTYPE           DHT11  // DHT11 sensor type
+#define GPS_RX_PIN        12     // ESP32 pin connected to GPS TX
+#define GPS_TX_PIN        13     // ESP32 pin connected to GPS RX
+#define SD_CS_PIN         33     // SD Card CS pin (may need to adjust)
+#define CCS811_RESET_PIN  0      // CCS811 reset pin
+#define CCS811_INT_PIN    2      // CCS811 interrupt pin
+#define I2C_SDA_PIN       33     // Alternate I2C SDA pin
+#define I2C_SCL_PIN       32     // Alternate I2C SCL pin
+
+// SPL06 pressure sensor uses I2C
+#define SPL06_ADDR        0x76
+#define SPL06_PSR_B2      0x00
+#define SPL06_TMP_B2      0x03
+#define SPL06_PRS_CFG     0x06
+#define SPL06_TMP_CFG     0x07
+#define SPL06_MEAS_CFG    0x08
+#define SPL06_CFG_REG     0x09
+#define SPL06_RESET       0x0C
+#define SPL06_ID          0x0D
+#define SPL06_COEF_BASE   0x10
+
+// WiFi credentials
+const char* ssid = "WeatherBalloon";
+const char* password = "balloon123";
+
+// Global objects
+WebServer server(80);
+TinyGPSPlus gps;
+DHT dht(DHTPIN, DHTTYPE);
+HardwareSerial gpsSerial(1); // Use UART1
+Adafruit_CCS811 ccs; // CCS811 air quality sensor
+
+// Global variables for sensor data
+float temperature = 0;
+float humidity = 0;
+float pressure = 0;
+float altitude = 0;
+float latitude = 0;
+float longitude = 0;
+int satellites = 0;
+String dateTime = "";
+int co2 = 0;
+int tvoc = 0;
+bool airQualitySensorReady = false;
+unsigned long lastSensorUpdate = 0;
+const unsigned long SENSOR_UPDATE_INTERVAL = 2000; // 2 seconds
+
+// Pressure sensor calibration coefficients
+int16_t c0, c1;
+int32_t c00, c10;
+int16_t c01, c11, c20, c21, c30;
+float kP = 3670016.0; // For 4x oversampling
+float kT = 3670016.0; // For 4x oversampling
+
+// Function prototypes
+void setupCamera();
+void setupWiFi();
+void setupSensors();
+void setupWebServer();
+void readSensors();
+void readPressureSensor();
+void readAirQualitySensor();
+void readCalibration();
+void handleRoot();
+void handleData();
+void handleCapture();
+void handleStream();
+void handleNotFound();
+float calculateAltitude(float pressure);
+
+void setup() {
+  // Disable brownout detector
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  
+  // Start serial communication
+  Serial.begin(115200);
+  Serial.println("\n\nESP32-CAM Weather Balloon Project");
+  
+  // Initialize file systems
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS initialization failed");
+  }
+  
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD Card initialization failed");
+  }
+  
+  // Setup components
+  setupCamera();
+  setupSensors();
+  setupWiFi();
+  setupWebServer();
+  
+  Serial.println("System initialized and ready");
+}
+
+void loop() {
+  // Handle web server clients
+  server.handleClient();
+  
+  // Process GPS data
+  while (gpsSerial.available() > 0) {
+    char c = gpsSerial.read();
+    gps.encode(c);
+  }
+  
+  // Update sensor readings periodically
+  if (millis() - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
+    readSensors();
+    lastSensorUpdate = millis();
+  }
+}
+
+void setupCamera() {
+  Serial.println("Setting up camera...");
+  
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Initial settings
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA; // 1600x1200
+    config.jpeg_quality = 10;  // 0-63, lower is higher quality
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA; // 800x600
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+  
+  // Initialize camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera initialization failed with error 0x%x", err);
+    return;
+  }
+  
+  // Set camera parameters
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_brightness(s, 0);     // -2 to 2
+  s->set_contrast(s, 0);       // -2 to 2
+  s->set_saturation(s, 0);     // -2 to 2
+  s->set_special_effect(s, 0); // 0 = No Effect, 1 = Negative, 2 = Grayscale, 3 = Red Tint, 4 = Green Tint, 5 = Blue Tint, 6 = Sepia
+  s->set_whitebal(s, 1);       // 0 = disable, 1 = enable
+  s->set_awb_gain(s, 1);       // 0 = disable, 1 = enable
+  s->set_wb_mode(s, 0);        // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
+  s->set_exposure_ctrl(s, 1);  // 0 = disable, 1 = enable
+  s->set_aec2(s, 0);           // 0 = disable, 1 = enable
+  s->set_gain_ctrl(s, 1);      // 0 = disable, 1 = enable
+  s->set_agc_gain(s, 0);       // 0 to 30
+  s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+  s->set_bpc(s, 0);            // 0 = disable, 1 = enable
+  s->set_wpc(s, 1);            // 0 = disable, 1 = enable
+  s->set_raw_gma(s, 1);        // 0 = disable, 1 = enable
+  s->set_lenc(s, 1);           // 0 = disable, 1 = enable
+  s->set_hmirror(s, 0);        // 0 = disable, 1 = enable
+  s->set_vflip(s, 0);          // 0 = disable, 1 = enable
+  s->set_dcw(s, 1);            // 0 = disable, 1 = enable
+  
+  Serial.println("Camera setup complete");
+}
+
+void setupSensors() {
+  Serial.println("Setting up sensors...");
+  
+  // Initialize DHT sensor
+  dht.begin();
+  
+  // Initialize GPS
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  
+  // Initialize I2C for pressure sensor and air quality sensor
+  // Using alternate pins to avoid conflict with camera
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  
+  // Reset CCS811
+  pinMode(CCS811_RESET_PIN, OUTPUT);
+  digitalWrite(CCS811_RESET_PIN, LOW);
+  delay(10);
+  digitalWrite(CCS811_RESET_PIN, HIGH);
+  delay(100);
+  
+  // Initialize CCS811
+  if (ccs.begin()) {
+    Serial.println("CCS811 air quality sensor initialized");
+    // Wait for the sensor to be ready
+    delay(1000);
+    airQualitySensorReady = true;
+  } else {
+    Serial.println("Failed to initialize CCS811 air quality sensor");
+    airQualitySensorReady = false;
+  }
+  
+  // Reset pressure sensor
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_RESET);
+  Wire.write(0x89);
+  Wire.endTransmission();
+  delay(50);
+  
+  // Configure pressure sensor
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_PRS_CFG);
+  Wire.write(0x22); // 4x pressure oversampling
+  Wire.endTransmission();
+  
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_TMP_CFG);
+  Wire.write(0x92); // External sensor, 4x temp oversampling
+  Wire.endTransmission();
+  
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_MEAS_CFG);
+  Wire.write(0x07); // Continuous pressure and temperature
+  Wire.endTransmission();
+  
+   Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_CFG_REG);
+  Wire.write(0x00); // FIFO disabled
+  Wire.endTransmission();
+  
+  // Read calibration coefficients
+  readCalibration();
+  
+  Serial.println("Sensors setup complete");
+}
+
+void setupWiFi() {
+  Serial.println("Setting up WiFi access point...");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+}
+
+void setupWebServer() {
+  Serial.println("Setting up web server...");
+  
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void readSensors() {
+  // Read DHT sensor
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+  
+  // Read pressure sensor
+  readPressureSensor();
+  
+  // Read air quality sensor
+  readAirQualitySensor();
+  
+  // Calculate altitude from pressure
+  altitude = calculateAltitude(pressure);
+  
+  // Read GPS data
+  if (gps.location.isValid()) {
+    latitude = gps.location.lat();
+    longitude = gps.location.lng();
+    satellites = gps.satellites.value();
+    
+    // Format date/time
+    char dateTimeBuffer[30];
+    sprintf(dateTimeBuffer, "%04d-%02d-%02d %02d:%02d:%02d", 
+            gps.date.year(), gps.date.month(), gps.date.day(),
+            gps.time.hour(), gps.time.minute(), gps.time.second());
+    dateTime = String(dateTimeBuffer);
+  }
+  
+  // Print sensor data to serial for debugging
+  Serial.println("Sensor Readings:");
+  Serial.print("Temperature: "); Serial.print(temperature); Serial.println(" °C");
+  Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
+  Serial.print("Pressure: "); Serial.print(pressure); Serial.println(" hPa");
+  Serial.print("Altitude: "); Serial.print(altitude); Serial.println(" m");
+  
+  if (airQualitySensorReady) {
+    Serial.print("CO2: "); Serial.print(co2); Serial.println(" ppm");
+    Serial.print("TVOC: "); Serial.print(tvoc); Serial.println(" ppb");
+  }
+  
+  if (gps.location.isValid()) {
+    Serial.print("GPS: "); 
+    Serial.print(latitude, 6); Serial.print(", "); 
+    Serial.println(longitude, 6);
+    Serial.print("Satellites: "); Serial.println(satellites);
+    Serial.print("Date/Time: "); Serial.println(dateTime);
+  } else {
+    Serial.println("GPS: No fix");
+  }
+}
+
+void readAirQualitySensor() {
+  if (!airQualitySensorReady) return;
+  
+  if (ccs.available()) {
+    if (!ccs.readData()) {
+      co2 = ccs.geteCO2();
+      tvoc = ccs.getTVOC();
+    } else {
+      Serial.println("CCS811 read error");
+    }
+  }
+}
+
+void readPressureSensor() {
+  uint8_t tempData[3];
+  uint8_t pressData[3];
+  int32_t rawTemp, rawPressure;
+  
+  // Read temperature
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_TMP_B2);
+  Wire.endTransmission(false);
+  
+  Wire.requestFrom(SPL06_ADDR, 3);
+  if (Wire.available() >= 3) {
+    tempData[0] = Wire.read();
+    tempData[1] = Wire.read();
+    tempData[2] = Wire.read();
+  }
+  
+  // Read pressure
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_PSR_B2);
+  Wire.endTransmission(false);
+  
+  Wire.requestFrom(SPL06_ADDR, 3);
+  if (Wire.available() >= 3) {
+    pressData[0] = Wire.read();
+    pressData[1] = Wire.read();
+    pressData[2] = Wire.read();
+  }
+  
+  // Convert temperature
+  rawTemp = ((uint32_t)tempData[0] << 16) | ((uint32_t)tempData[1] << 8) | tempData[2];
+  if (rawTemp & 0x800000) rawTemp |= 0xFF000000;
+  
+  // Convert pressure
+  rawPressure = ((uint32_t)pressData[0] << 16) | ((uint32_t)pressData[1] << 8) | pressData[2];
+  if (rawPressure & 0x800000) rawPressure |= 0xFF000000;
+  
+  // Calculate scaled values
+  float scaledTemp = (float)rawTemp / kT;
+  float scaledPressure = (float)rawPressure / kP;
+  
+  // Calculate compensated pressure
+  pressure = c00 + 
+             scaledPressure * (c10 + 
+             scaledPressure * (c20 + 
+             scaledPressure * c30)) + 
+             scaledTemp * c01 + 
+             scaledTemp * scaledPressure * (c11 + 
+             scaledPressure * c21);
+  
+  // Convert to hPa
+  pressure /= 100.0;
+}
+
+void readCalibration() {
+  uint8_t coef[18];
+  
+  Wire.beginTransmission(SPL06_ADDR);
+  Wire.write(SPL06_COEF_BASE);
+  Wire.endTransmission(false);
+  
+  Wire.requestFrom(SPL06_ADDR, 18);
+  for (int i = 0; i < 18; i++) {
+    coef[i] = Wire.read();
+  }
+  
+  // c0, c1
+  c0 = (coef[0] << 4) | (coef[1] >> 4);
+  if (c0 & 0x800) c0 |= 0xF000;
+  
+  c1 = ((coef[1] & 0x0F) << 8) | coef[2];
+  if (c1 & 0x800) c1 |= 0xF000;
+  
+  // c00, c10
+  c00 = ((uint32_t)coef[3] << 12) | ((uint32_t)coef[4] << 4) | (coef[5] >> 4);
+  if (c00 & 0x80000) c00 |= 0xFFF00000;
+  
+  c10 = ((uint32_t)(coef[5] & 0x0F) << 16) | ((uint32_t)coef[6] << 8) | coef[7];
+  if (c10 & 0x80000) c10 |= 0xFFF00000;
+  
+  // c01, c11, c20, c21, c30
+  c01 = ((uint16_t)coef[8] << 8) | coef[9];
+  c11 = ((uint16_t)coef[10] << 8) | coef[11];
+  c20 = ((uint16_t)coef[12] << 8) | coef[13];
+  c21 = ((uint16_t)coef[14] << 8) | coef[15];
+  c30 = ((uint16_t)coef[16] << 8) | coef[17];
+}
+
+float calculateAltitude(float pressure) {
+  // International barometric formula
+  const float seaLevelPressure = 1024.25; // hPa at sea level
+  return 44330.0 * (1.0 - pow(pressure / seaLevelPressure, 0.1903));
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Weather Balloon Station</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;padding:20px;}</style>";
+  html += "</head><body>";
+  
+  html += "<h1>Weather Balloon Monitoring</h1>";
+  
+  // Camera section
+  html += "<div style='margin-bottom:20px;'>";
+  html += "<h2>Camera</h2>";
+  html += "<img id='cameraImage' src='/capture' style='max-width:100%; height:auto;'>";
+  html += "<div style='margin-top:10px;'>";
+  html += "<button onclick='refreshImage()'>Refresh Image</button>";
+  html += "<a href='/stream' target='_blank' style='margin-left:10px;'>Live Stream</a>";
+  html += "</div></div>";
+  
+  // Sensor data section
+  html += "<div style='margin-bottom:20px;'>";
+  html += "<h2>Sensor Data</h2>";
+  html += "<div id='sensorData'>Loading...</div>";
+  html += "</div>";
+  
+  // Debug section
+  html += "<div style='margin-bottom:20px;'>";
+  html += "<h2>Debug</h2>";
+  html += "<button onclick='testDataFetch()'>Test Data Fetch</button>";
+  html += "<pre id='debugData' style='margin-top:10px;background:#f0f0f0;padding:10px;'>Click Test Data Fetch</pre>";
+  html += "</div>";
+  
+  // Simple JavaScript
+  html += "<script>";
+  
+  // Function to refresh the camera image
+  html += "function refreshImage() {";
+  html += "  document.getElementById('cameraImage').src = '/capture?' + new Date().getTime();";
+  html += "}";
+  
+  // Function to test data fetching and display raw response
+  html += "function testDataFetch() {";
+  html += "  fetch('/data')";
+  html += "    .then(response => response.text())";
+  html += "    .then(text => {";
+  html += "      document.getElementById('debugData').textContent = text;";
+  html += "      try {";
+  html += "        updateDisplay(JSON.parse(text));";
+  html += "      } catch(e) {";
+  html += "        console.error('JSON parse error:', e);";
+  html += "      }";
+  html += "    })";
+  html += "    .catch(error => {";
+  html += "      document.getElementById('debugData').textContent = 'Error: ' + error.message;";
+  html += "    });";
+  html += "}";
+  
+  // Function to update the display with sensor data
+  html += "function updateDisplay(data) {";
+  html += "  let html = '';";
+  html += "  html += '<p><strong>Temperature:</strong> ' + data.temperature + ' °C</p>';";
+  html += "  html += '<p><strong>Humidity:</strong> ' + data.humidity + ' %</p>';";
+  html += "  html += '<p><strong>Pressure:</strong> ' + data.pressure + ' hPa</p>';";
+  html += "  html += '<p><strong>Altitude:</strong> ' + data.altitude + ' m</p>';";
+  html += "  html += '<p><strong>CO2:</strong> ' + data.co2 + ' ppm</p>';";
+  html += "  html += '<p><strong>TVOC:</strong> ' + data.tvoc + ' ppb</p>';";
+  html += "  document.getElementById('sensorData').innerHTML = html;";
+  html += "}";
+  
+  // Fetch data every 5 seconds
+  html += "setInterval(function() {";
+  html += "  fetch('/data')";
+  html += "    .then(response => response.json())";
+  html += "    .then(data => updateDisplay(data))";
+  html += "    .catch(error => console.error('Error:', error));";
+  html += "}, 5000);";
+  
+  // Initial data fetch
+  html += "testDataFetch();";
+  
+  html += "</script>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleData() {
+  // Create a properly formatted JSON response
+  String json = "{";
+  json += "\"temperature\":" + String(isnan(temperature) ? 0 : temperature) + ",";
+  json += "\"humidity\":" + String(isnan(humidity) ? 0 : humidity) + ",";
+  json += "\"pressure\":" + String(pressure) + ",";
+  json += "\"altitude\":" + String(altitude) + ",";
+  json += "\"co2\":" + String(co2) + ",";
+  json += "\"tvoc\":" + String(tvoc) + ",";
+  
+  // GPS data
+  json += "\"gpsValid\":" + String(gps.location.isValid() ? "true" : "false") + ",";
+  json += "\"latitude\":" + String(latitude, 6) + ",";
+  json += "\"longitude\":" + String(longitude, 6) + ",";
+  json += "\"satellites\":" + String(satellites) + ",";
+  json += "\"dateTime\":\"" + dateTime + "\"";
+  
+  json += "}";
+  
+  // Add CORS headers to allow any origin
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+  
+  // Debug output
+  Serial.println("Sending data to client:");
+  Serial.println(json);
+}
+
+void handleCapture() {
+  camera_fb_t *fb = NULL;
+  fb = esp_camera_fb_get();
+  
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.sendHeader("Content-Length", String(fb->len));
+  server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+  
+  // Return the frame buffer back to be reused
+  esp_camera_fb_return(fb);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  client.print(response);
+  
+  while (client.connected()) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      delay(1000);
+      continue;
+    }
+    
+    client.print("--frame\r\n");
+    client.print("Content-Type: image/jpeg\r\n\r\n");
+    client.write((const char *)fb->buf, fb->len);
+    client.print("\r\n");
+    
+    esp_camera_fb_return(fb);
+    delay(100); // Adjust frame rate
+  }
+}
+
+void handleNotFound() {
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  
+  server.send(404, "text/plain", message);
+}
+
+
+
+
+
+
