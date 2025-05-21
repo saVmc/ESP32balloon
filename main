@@ -81,6 +81,19 @@ bool airQualitySensorReady = false;
 unsigned long lastSensorUpdate = 0;
 const unsigned long SENSOR_UPDATE_INTERVAL = 2000; // 2 seconds
 
+// New variables for enhanced metrics
+float dewPoint = 0;       // Dew point in °C
+float heatIndex = 0;      // Heat index in °C
+float absoluteHumidity = 0; // Absolute humidity in g/m³
+float feelsLike = 0;      // "Feels like" temperature in °C
+
+// New variables for enhanced GPS data
+int gpsSignalStrength = 0; // 0-5 scale
+float gpsHDOP = 99.99;     // Horizontal dilution of precision (lower is better)
+float gpsSpeed = 0;        // Speed in km/h
+float gpsCourse = 0;       // Course in degrees
+float gpsAltitude = 0;     // GPS-reported altitude
+
 // Pressure sensor calibration coefficients
 int16_t c0, c1;
 int32_t c00, c10;
@@ -103,6 +116,10 @@ void handleCapture();
 void handleStream();
 void handleNotFound();
 float calculateAltitude(float pressure);
+float calculateDewPoint(float temp, float humidity);
+float calculateHeatIndex(float temp, float humidity);
+float calculateAbsoluteHumidity(float temp, float relHumidity);
+float calculateFeelsLike(float temp, float humidity, float pressure);
 
 void setup() {
   // Disable brownout detector
@@ -138,6 +155,20 @@ void loop() {
   while (gpsSerial.available() > 0) {
     char c = gpsSerial.read();
     gps.encode(c);
+    
+    // Print raw NMEA sentences occasionally for debugging
+    static unsigned long lastDebugTime = 0;
+    if (millis() - lastDebugTime > 30000) { // Every 30 seconds
+      Serial.println("Raw GPS data sample:");
+      Serial.write(c);
+      for (int i = 0; i < 100 && gpsSerial.available(); i++) {
+        c = gpsSerial.read();
+        Serial.write(c);
+        gps.encode(c);
+      }
+      Serial.println();
+      lastDebugTime = millis();
+    }
   }
   
   // Update sensor readings periodically
@@ -268,8 +299,8 @@ void setupSensors() {
   Wire.write(SPL06_MEAS_CFG);
   Wire.write(0x07); // Continuous pressure and temperature
   Wire.endTransmission();
-  
-   Wire.beginTransmission(SPL06_ADDR);
+   
+  Wire.beginTransmission(SPL06_ADDR);
   Wire.write(SPL06_CFG_REG);
   Wire.write(0x00); // FIFO disabled
   Wire.endTransmission();
@@ -304,10 +335,69 @@ void setupWebServer() {
   Serial.println("Web server started");
 }
 
+// New calculation functions for weather metrics
+float calculateDewPoint(float temp, float humidity) {
+  // Magnus formula for dew point
+  float a = 17.27;
+  float b = 237.7;
+  float alpha = ((a * temp) / (b + temp)) + log(humidity / 100.0);
+  return (b * alpha) / (a - alpha);
+}
+
+float calculateHeatIndex(float temp, float humidity) {
+  // Simplified heat index calculation (Steadman's formula)
+  if (temp < 27) return temp; // Heat index only relevant at higher temperatures
+  
+  // Convert to Fahrenheit for the standard formula
+  float tempF = (temp * 9.0 / 5.0) + 32.0;
+  float heatIndexF = 0.5 * (tempF + 61.0 + ((tempF - 68.0) * 1.2) + (humidity * 0.094));
+  
+  // More accurate formula for higher temperatures
+  if (tempF >= 80.0) {
+    heatIndexF = -42.379 + 
+                 2.04901523 * tempF + 
+                 10.14333127 * humidity -
+                 0.22475541 * tempF * humidity -
+                 0.00683783 * tempF * tempF -
+                 0.05481717 * humidity * humidity +
+                 0.00122874 * tempF * tempF * humidity +
+                 0.00085282 * tempF * humidity * humidity -
+                 0.00000199 * tempF * tempF * humidity * humidity;
+  }
+  
+  // Convert back to Celsius
+  return (heatIndexF - 32.0) * 5.0 / 9.0;
+}
+
+float calculateAbsoluteHumidity(float temp, float relHumidity) {
+  // Calculate absolute humidity in g/m³
+  float es = 6.112 * exp((17.67 * temp) / (temp + 243.5));
+  float e = (relHumidity / 100.0) * es;
+  return (2.1674 * e) / (273.15 + temp);
+}
+
+float calculateFeelsLike(float temp, float humidity, float pressure) {
+  // Use heat index for warm conditions
+  if (temp > 20) {
+    return calculateHeatIndex(temp, humidity);
+  }
+  // For cooler conditions, we'd need wind speed for wind chill
+  // Since we don't have wind speed, just return temperature
+  return temp;
+}
+
 void readSensors() {
   // Read DHT sensor
   humidity = dht.readHumidity();
   temperature = dht.readTemperature();
+  
+  // Calculate additional weather metrics
+  if (!isnan(temperature) && !isnan(humidity)) {
+    dewPoint = calculateDewPoint(temperature, humidity);
+    heatIndex = calculateHeatIndex(temperature, humidity);
+    absoluteHumidity = calculateAbsoluteHumidity(temperature, humidity);
+    feelsLike = calculateFeelsLike(temperature, humidity, pressure);
+  }
   
   // Read pressure sensor
   readPressureSensor();
@@ -324,6 +414,34 @@ void readSensors() {
     longitude = gps.location.lng();
     satellites = gps.satellites.value();
     
+    // Get HDOP (lower = better precision)
+    if (gps.hdop.isValid()) {
+      gpsHDOP = gps.hdop.hdop();
+      // Calculate signal strength (0-5) based on HDOP
+      // HDOP < 1 is excellent, > 20 is very poor
+      if (gpsHDOP < 1.0) gpsSignalStrength = 5;
+      else if (gpsHDOP < 2.0) gpsSignalStrength = 4;
+      else if (gpsHDOP < 5.0) gpsSignalStrength = 3;
+      else if (gpsHDOP < 10.0) gpsSignalStrength = 2;
+      else if (gpsHDOP < 20.0) gpsSignalStrength = 1;
+      else gpsSignalStrength = 0;
+    }
+    
+    // Get speed in km/h
+    if (gps.speed.isValid()) {
+      gpsSpeed = gps.speed.kmph();
+    }
+    
+    // Get course/heading in degrees
+    if (gps.course.isValid()) {
+      gpsCourse = gps.course.deg();
+    }
+    
+    // Get GPS altitude
+    if (gps.altitude.isValid()) {
+      gpsAltitude = gps.altitude.meters();
+    }
+    
     // Format date/time
     char dateTimeBuffer[30];
     sprintf(dateTimeBuffer, "%04d-%02d-%02d %02d:%02d:%02d", 
@@ -338,20 +456,31 @@ void readSensors() {
   Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
   Serial.print("Pressure: "); Serial.print(pressure); Serial.println(" hPa");
   Serial.print("Altitude: "); Serial.print(altitude); Serial.println(" m");
+  Serial.print("Dew Point: "); Serial.print(dewPoint); Serial.println(" °C");
+  Serial.print("Heat Index: "); Serial.print(heatIndex); Serial.println(" °C");
+  Serial.print("Feels Like: "); Serial.print(feelsLike); Serial.println(" °C");
+  Serial.print("Absolute Humidity: "); Serial.print(absoluteHumidity); Serial.println(" g/m³");
   
   if (airQualitySensorReady) {
     Serial.print("CO2: "); Serial.print(co2); Serial.println(" ppm");
     Serial.print("TVOC: "); Serial.print(tvoc); Serial.println(" ppb");
   }
   
+  // Print enhanced GPS data to serial
+  Serial.println("GPS Data:");
   if (gps.location.isValid()) {
-    Serial.print("GPS: "); 
+    Serial.print("  Position: "); 
     Serial.print(latitude, 6); Serial.print(", "); 
     Serial.println(longitude, 6);
-    Serial.print("Satellites: "); Serial.println(satellites);
-    Serial.print("Date/Time: "); Serial.println(dateTime);
+    Serial.print("  Satellites: "); Serial.println(satellites);
+    Serial.print("  HDOP: "); Serial.println(gpsHDOP);
+    Serial.print("  Signal Strength: "); Serial.print(gpsSignalStrength); Serial.println("/5");
+    Serial.print("  Speed: "); Serial.print(gpsSpeed); Serial.println(" km/h");
+    Serial.print("  Course: "); Serial.print(gpsCourse); Serial.println("°");
+    Serial.print("  Altitude: "); Serial.print(gpsAltitude); Serial.println(" m");
+    Serial.print("  Date/Time: "); Serial.println(dateTime);
   } else {
-    Serial.println("GPS: No fix");
+    Serial.println("  No fix");
   }
 }
 
@@ -411,12 +540,12 @@ void readPressureSensor() {
   
   // Calculate compensated pressure
   pressure = c00 + 
-             scaledPressure * (c10 + 
-             scaledPressure * (c20 + 
-             scaledPressure * c30)) + 
-             scaledTemp * c01 + 
-             scaledTemp * scaledPressure * (c11 + 
-             scaledPressure * c21);
+            scaledPressure * (c10 + 
+            scaledPressure * (c20 + 
+            scaledPressure * c30)) + 
+            scaledTemp * c01 + 
+            scaledTemp * scaledPressure * (c11 + 
+            scaledPressure * c21);
   
   // Convert to hPa
   pressure /= 100.0;
@@ -466,13 +595,13 @@ void handleRoot() {
   String html = "<!DOCTYPE html><html><head>";
   html += "<title>Weather Balloon Station</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>body{font-family:Arial;padding:20px;}</style>";
+  html += "<style>body{font-family:Arial;padding:20px;} .section{margin-bottom:20px;padding:15px;border:1px solid #ddd;border-radius:5px;} .signal-bar{display:inline-block;width:15px;height:15px;margin-right:2px;background:#ddd;} .signal-active{background:#4CAF50;}</style>";
   html += "</head><body>";
   
   html += "<h1>Weather Balloon Monitoring</h1>";
   
   // Camera section
-  html += "<div style='margin-bottom:20px;'>";
+  html += "<div class='section'>";
   html += "<h2>Camera</h2>";
   html += "<img id='cameraImage' src='/capture' style='max-width:100%; height:auto;'>";
   html += "<div style='margin-top:10px;'>";
@@ -481,13 +610,13 @@ void handleRoot() {
   html += "</div></div>";
   
   // Sensor data section
-  html += "<div style='margin-bottom:20px;'>";
+  html += "<div class='section'>";
   html += "<h2>Sensor Data</h2>";
   html += "<div id='sensorData'>Loading...</div>";
   html += "</div>";
   
   // Debug section
-  html += "<div style='margin-bottom:20px;'>";
+  html += "<div class='section'>";
   html += "<h2>Debug</h2>";
   html += "<button onclick='testDataFetch()'>Test Data Fetch</button>";
   html += "<pre id='debugData' style='margin-top:10px;background:#f0f0f0;padding:10px;'>Click Test Data Fetch</pre>";
@@ -521,12 +650,38 @@ void handleRoot() {
   // Function to update the display with sensor data
   html += "function updateDisplay(data) {";
   html += "  let html = '';";
-  html += "  html += '<p><strong>Temperature:</strong> ' + data.temperature + ' °C</p>';";
-  html += "  html += '<p><strong>Humidity:</strong> ' + data.humidity + ' %</p>';";
-  html += "  html += '<p><strong>Pressure:</strong> ' + data.pressure + ' hPa</p>';";
-  html += "  html += '<p><strong>Altitude:</strong> ' + data.altitude + ' m</p>';";
+  
+  html += "  html += '<h3>Weather Metrics</h3>';";
+   html += "  html += '<p><strong>Temperature:</strong> ' + data.temperature.toFixed(1) + ' °C</p>';";
+  html += "  html += '<p><strong>Humidity:</strong> ' + data.humidity.toFixed(1) + ' %</p>';";
+  html += "  html += '<p><strong>Pressure:</strong> ' + data.pressure.toFixed(1) + ' hPa</p>';";
+  html += "  html += '<p><strong>Altitude:</strong> ' + data.altitude.toFixed(1) + ' m</p>';";
+  html += "  html += '<p><strong>Dew Point:</strong> ' + data.dewPoint.toFixed(1) + ' °C</p>';";
+  html += "  html += '<p><strong>Heat Index:</strong> ' + data.heatIndex.toFixed(1) + ' °C</p>';";
+  html += "  html += '<p><strong>Feels Like:</strong> ' + data.feelsLike.toFixed(1) + ' °C</p>';";
+  html += "  html += '<p><strong>Absolute Humidity:</strong> ' + data.absoluteHumidity.toFixed(1) + ' g/m³</p>';";
+  
+  html += "  html += '<h3>Air Quality</h3>';";
   html += "  html += '<p><strong>CO2:</strong> ' + data.co2 + ' ppm</p>';";
   html += "  html += '<p><strong>TVOC:</strong> ' + data.tvoc + ' ppb</p>';";
+  
+  html += "  html += '<h3>GPS Data</h3>';";
+  html += "  if (data.gpsValid) {";
+  html += "    html += '<p><strong>Position:</strong> ' + data.latitude.toFixed(6) + ', ' + data.longitude.toFixed(6) + '</p>';";
+  html += "    html += '<p><strong>Satellites:</strong> ' + data.satellites + '</p>';";
+  html += "    html += '<p><strong>GPS Signal:</strong> ';";
+  html += "    for (let i = 0; i < 5; i++) {";
+  html += "      html += '<span class=\"signal-bar ' + (i < data.gpsSignalStrength ? 'signal-active' : '') + '\"></span>';";
+  html += "    }";
+  html += "    html += '</p>';";
+  html += "    html += '<p><strong>HDOP:</strong> ' + data.gpsHDOP.toFixed(2) + ' (lower is better)</p>';";
+  html += "    html += '<p><strong>Speed:</strong> ' + data.gpsSpeed.toFixed(1) + ' km/h</p>';";
+  html += "    html += '<p><strong>Course:</strong> ' + data.gpsCourse.toFixed(1) + '°</p>';";
+  html += "    html += '<p><strong>GPS Altitude:</strong> ' + data.gpsAltitude.toFixed(1) + ' m</p>';";
+  html += "    html += '<p><strong>Date/Time:</strong> ' + data.dateTime + '</p>';";
+  html += "  } else {";
+  html += "    html += '<p>No GPS fix</p>';";
+  html += "  }";
   html += "  document.getElementById('sensorData').innerHTML = html;";
   html += "}";
   
@@ -554,6 +709,10 @@ void handleData() {
   json += "\"humidity\":" + String(isnan(humidity) ? 0 : humidity) + ",";
   json += "\"pressure\":" + String(pressure) + ",";
   json += "\"altitude\":" + String(altitude) + ",";
+  json += "\"dewPoint\":" + String(dewPoint) + ",";
+  json += "\"heatIndex\":" + String(heatIndex) + ",";
+  json += "\"feelsLike\":" + String(feelsLike) + ",";
+  json += "\"absoluteHumidity\":" + String(absoluteHumidity) + ",";
   json += "\"co2\":" + String(co2) + ",";
   json += "\"tvoc\":" + String(tvoc) + ",";
   
@@ -562,6 +721,11 @@ void handleData() {
   json += "\"latitude\":" + String(latitude, 6) + ",";
   json += "\"longitude\":" + String(longitude, 6) + ",";
   json += "\"satellites\":" + String(satellites) + ",";
+  json += "\"gpsSignalStrength\":" + String(gpsSignalStrength) + ",";
+  json += "\"gpsHDOP\":" + String(gpsHDOP) + ",";
+  json += "\"gpsSpeed\":" + String(gpsSpeed) + ",";
+  json += "\"gpsCourse\":" + String(gpsCourse) + ",";
+  json += "\"gpsAltitude\":" + String(gpsAltitude) + ",";
   json += "\"dateTime\":\"" + dateTime + "\"";
   
   json += "}";
@@ -636,6 +800,7 @@ void handleNotFound() {
   
   server.send(404, "text/plain", message);
 }
+
 
 
 
