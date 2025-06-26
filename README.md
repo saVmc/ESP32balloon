@@ -47,7 +47,7 @@ Features camera usage, data monitoring, and logging.
 ## Web Interface
 
 - **Connect to WiFi:**  
-  Connect to the ESP32's WiFi AP (default AP = *WeatherBalloon*).
+  Connect to the ESP32's WiFi AP (default AP = *WeatherBalloon*, password = `balloon123`).
 - **Visit the Webpage:**  
   Go to `http://192.168.4.1` in your browser.
 - **Sections:**
