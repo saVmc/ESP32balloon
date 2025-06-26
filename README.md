@@ -40,14 +40,14 @@ Features camera usage, data monitoring, and logging.
 3. **Wiring:**  
    See comments in the `.ino` file for pinouts.
 4. **Configuration:**  
-   - Set your WiFi SSID and password in the `.ino` file (default: ESP32 is an AP named `AdamisCool`)
+   - Set your WiFi SSID and password in the `.ino` file (default: ESP32 is an AP named *WeatherBalloon*)
 5. **Upload:**  
    Compile and upload the code to your ESP32-CAM.
 
 ## Web Interface
 
 - **Connect to WiFi:**  
-  Connect to the ESP32's WiFi AP.
+  Connect to the ESP32's WiFi AP (default AP = *WeatherBalloon*).
 - **Visit the Webpage:**  
   Go to `http://192.168.4.1` in your browser.
 - **Sections:**
@@ -56,15 +56,10 @@ Features camera usage, data monitoring, and logging.
   - **Serial Monitor:** Watch ESP32 serial output live.
   - **Download CSV:** Get recent sensor data as a CSV file.
 
-## Example Screenshot
-
-*Add your screenshots here!*
 
 ## Credits
 
 Written and designed by Farley Hammond (10CPTY).  
-Special thanks to open-source contributors.
+Special thanks to jorteh
 
-## License
 
-MIT License (or your preferred license).
