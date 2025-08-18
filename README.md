@@ -9,6 +9,7 @@ Features camera usage, data monitoring, and logging.
   View real-time data from temperature, humidity, air pressure, GPS, and air quality sensors via a web interface.
 - **Camera:**  
   Take and download low or high-resolution photos, with GPS EXIF tags embedded.
+  N.B this works pretty inconsistently due to the absence of an on-board clock, so the EXIF is only embed with a GPS connection
 - **CSV Logging:**  
   Download recent sensor readings as a CSV file.
 - **GPS Tracking:**  
