@@ -39,9 +39,9 @@ Features camera usage, data monitoring, and logging.
    - [DHT sensor library](https://github.com/adafruit/DHT-sensor-library)
    - [WebSockets by Markus Sattler](https://github.com/Links2004/arduinoWebSockets)
 3. **Wiring:**  
-   See comments in the `.ino` file for pinouts.
+   See the top of the main file for pinouts
 4. **Configuration:**  
-   - Set your WiFi SSID and password in the `.ino` file (default: ESP32 is an AP named *WeatherBalloon*)
+   - Set your WiFi SSID and password in the main file (default: ESP32 is an AP named *WeatherBalloon*)
 5. **Upload:**  
    Compile and upload the code to your ESP32-CAM.
 
